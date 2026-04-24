@@ -24,7 +24,7 @@ def _format_hit_probability(value: float) -> str:
 
 
 def _write_projection_rows(path: Path, projection_rows) -> None:
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(["Player", "Team", "AB", "R", "H", "1+H%", "2+H%", "2B", "3B", "HR", "RBI", "BB", "AVG", "OBP", "SLG"])
         for projection in projection_rows:
@@ -121,22 +121,126 @@ def _print_summary(summary, away_pitcher: str, home_pitcher: str) -> None:
             print(line)
 
 
-def _print_lineup_inspection(inspection) -> None:
-    status = "SET" if inspection.is_set else "TBD"
-    print(
-        f"{status} {inspection.away_team} at {inspection.home_team} "
-        f"({len(inspection.away_lineup)}/9 away, {len(inspection.home_lineup)}/9 home) via {inspection.source}"
-    )
+LINEUP_STATUS_ORDER = ("ready", "partial", "waiting")
+LINEUP_STATUS_LABELS = {
+    "ready": "READY",
+    "partial": "PARTIAL",
+    "waiting": "WAITING",
+}
+LINEUP_SECTION_TITLES = {
+    "ready": "Ready to simulate",
+    "partial": "Partially posted",
+    "waiting": "Waiting on lineups",
+}
+SOURCE_LABELS = {
+    "starting-lineups": "MLB Starting Lineups",
+    "boxscore": "MLB game feed",
+    "auto": "Automatic source selection",
+}
+
+
+def _lineup_status_key(inspection) -> str:
+    away_count = len(inspection.away_lineup)
+    home_count = len(inspection.home_lineup)
+    if away_count == 9 and home_count == 9:
+        return "ready"
+    if away_count > 0 or home_count > 0:
+        return "partial"
+    return "waiting"
+
+
+def _friendly_source_label(source: str) -> str:
+    return SOURCE_LABELS.get(source, source.replace("-", " ").title())
+
+
+def _friendly_lineup_status_message(inspection) -> str:
+    away_count = len(inspection.away_lineup)
+    home_count = len(inspection.home_lineup)
+    note = inspection.note.lower()
+
+    if away_count == 9 and home_count == 9:
+        return "Both batting orders are fully posted."
+
+    if away_count == 0 and home_count == 0:
+        if "no matching lineup card was found" in note:
+            return "This matchup is not listed on MLB Starting Lineups yet."
+        if "matched this game" in note:
+            return "The matchup is listed, but neither batting order is posted yet."
+        if "official lineup" in note or "live feed" in note or "boxscore" in note:
+            return "The official MLB feed does not have lineups posted yet."
+        return "Waiting on both batting orders."
+
+    missing_away = max(0, 9 - away_count)
+    missing_home = max(0, 9 - home_count)
+    if missing_away and missing_home:
+        return f"Both teams have partial lineups posted ({missing_away} away hitter(s) and {missing_home} home hitter(s) still missing)."
+    if missing_away:
+        return f"The away lineup is partially posted ({missing_away} hitter(s) still missing)."
+    return f"The home lineup is partially posted ({missing_home} hitter(s) still missing)."
+
+
+
+def _build_lineup_inspection_lines(inspection) -> list[str]:
+    status_key = _lineup_status_key(inspection)
+    status_label = LINEUP_STATUS_LABELS[status_key]
+    away_count = len(inspection.away_lineup)
+    home_count = len(inspection.home_lineup)
+
+    lines = [
+        f"[{status_label}] {inspection.away_team} at {inspection.home_team}",
+        f"  Hitters posted: Away {away_count}/9 | Home {home_count}/9",
+    ]
+
     if inspection.away_pitcher or inspection.home_pitcher:
-        away_pitcher = inspection.away_pitcher.player_name if inspection.away_pitcher else ""
-        home_pitcher = inspection.home_pitcher.player_name if inspection.home_pitcher else ""
-        print(f"  Pitchers: {away_pitcher} vs {home_pitcher}")
+        away_pitcher = inspection.away_pitcher.player_name if inspection.away_pitcher else "TBD"
+        home_pitcher = inspection.home_pitcher.player_name if inspection.home_pitcher else "TBD"
+        lines.append(f"  Probable pitchers: {away_pitcher} vs {home_pitcher}")
+
+    lines.append(f"  Status: {_friendly_lineup_status_message(inspection)}")
+    lines.append(f"  Source: {_friendly_source_label(inspection.source)}")
+
     if inspection.away_lineup:
-        print("  Away: " + ", ".join(player.player_name for player in inspection.away_lineup))
+        lines.append("  Away lineup: " + ", ".join(player.player_name for player in inspection.away_lineup))
     if inspection.home_lineup:
-        print("  Home: " + ", ".join(player.player_name for player in inspection.home_lineup))
-    if inspection.note:
-        print(f"  Note: {inspection.note}")
+        lines.append("  Home lineup: " + ", ".join(player.player_name for player in inspection.home_lineup))
+    return lines
+
+
+
+def _print_lineup_check_report(inspections, date_text: str) -> None:
+    counts = {status: 0 for status in LINEUP_STATUS_ORDER}
+    for inspection in inspections:
+        counts[_lineup_status_key(inspection)] += 1
+
+    separator = "=" * 72
+    print(separator)
+    print(f"Lineup check for {date_text}")
+    print(
+        f"Ready: {counts['ready']} | Partial: {counts['partial']} | "
+        f"Waiting: {counts['waiting']} | Total: {len(inspections)}"
+    )
+    print(separator)
+
+    first_section = True
+    for status_key in LINEUP_STATUS_ORDER:
+        grouped = [inspection for inspection in inspections if _lineup_status_key(inspection) == status_key]
+        if not grouped:
+            continue
+        if first_section:
+            print()
+            first_section = False
+        else:
+            print()
+
+        title = LINEUP_SECTION_TITLES[status_key]
+        print(f"{title} ({len(grouped)})")
+        print("-" * len(f"{title} ({len(grouped)})"))
+        for index, inspection in enumerate(grouped):
+            for line in _build_lineup_inspection_lines(inspection):
+                print(line)
+            if index != len(grouped) - 1:
+                print()
+
 
 
 def _resolve_league_averages(args) -> tuple[LeagueAverages, str]:
@@ -257,9 +361,8 @@ def main(argv: list[str] | None = None) -> int:
             games = [matchup.game_id for matchup in daily_games]
 
         if args.check_lineups:
-            for game_id in games:
-                inspection = client.inspect_game_lineup(game_id, lineup_source=args.lineup_source)
-                _print_lineup_inspection(inspection)
+            inspections = [client.inspect_game_lineup(game_id, lineup_source=args.lineup_source) for game_id in games]
+            _print_lineup_check_report(inspections, args.date)
             return 0
 
         if not args.quiet_league_averages:
