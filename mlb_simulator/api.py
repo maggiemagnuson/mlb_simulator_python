@@ -81,11 +81,13 @@ _OFFICIAL_TEAM_NAMES = {
 _TEAM_STATS_TOKEN_RE = re.compile(r"\d+\.\d+|\.\d+|\d+")
 _TEAM_BULLPEN_ROW_RE = re.compile(r"^(AL|NL)\b")
 _TEAM_BULLPEN_CACHE_FORMAT_VERSION = 2
+_BATTING_SIDE_RE = re.compile(r"\(([LRS])\)")
+_THROWING_HAND_RE = re.compile(r"\b([LRS])HP\b")
 
 _DEFAULT_PLAYER_CACHE_DIRNAME = "player_cache"
 _PRIOR_SEASON_WEIGHTS = (5.0, 4.0, 3.0)
-_PLAYER_CACHE_FORMAT_VERSION = 5
-_PROFILE_CACHE_MODEL_VERSION = 5
+_PLAYER_CACHE_FORMAT_VERSION = 6
+_PROFILE_CACHE_MODEL_VERSION = 7
 
 _HITTER_PRIOR_PA_CAPS = {
     "walk": 120.0,
@@ -124,10 +126,56 @@ def _safe_divide(numerator: float, denominator: float) -> float:
     if denominator <= 0.0:
         return 0.0
     return numerator / denominator
+
+
+def _normalize_batting_side(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"L", "R", "S"}:
+        return text
+    return ""
+
+
+def _normalize_throwing_hand(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"L", "R", "S"}:
+        return text
+    return ""
+
+
+def _extract_batting_side(value: Any) -> str:
+    match = _BATTING_SIDE_RE.search(str(value or "").upper())
+    if match is None:
+        return ""
+    return _normalize_batting_side(match.group(1))
+
+
+def _extract_throwing_hand(value: Any) -> str:
+    match = _THROWING_HAND_RE.search(str(value or "").upper())
+    if match is None:
+        return ""
+    return _normalize_throwing_hand(match.group(1))
+
+
+def _merge_handedness_into_record(
+    record: dict[str, Any],
+    *,
+    bats: str = "",
+    throws: str = "",
+) -> dict[str, Any]:
+    merged = dict(record or {})
+    normalized_bats = _normalize_batting_side(bats or merged.get("bats") or merged.get("batSide"))
+    normalized_throws = _normalize_throwing_hand(throws or merged.get("throws") or merged.get("pitchHand"))
+    if normalized_bats:
+        merged["bats"] = normalized_bats
+    if normalized_throws:
+        merged["throws"] = normalized_throws
+    return merged
 @dataclass(slots=True)
 class LineupPlayer:
     player_id: int
     player_name: str
+    bats: str = ""
+    throws: str = ""
 
 
 @dataclass(slots=True)
@@ -500,8 +548,14 @@ class MlbDataClient:
         if len(card.away_lineup) != 9 or len(card.home_lineup) != 9:
             return None
 
-        away_lineup = [self._fetch_batter_from_player_id(player.player_id, player.player_name, season=season) for player in card.away_lineup]
-        home_lineup = [self._fetch_batter_from_player_id(player.player_id, player.player_name, season=season) for player in card.home_lineup]
+        away_lineup = [
+            self._fetch_batter_from_player_id(player.player_id, player.player_name, season=season, bats=player.bats)
+            for player in card.away_lineup
+        ]
+        home_lineup = [
+            self._fetch_batter_from_player_id(player.player_id, player.player_name, season=season, bats=player.bats)
+            for player in card.home_lineup
+        ]
 
         away_pitcher_id = self._preferred_pitcher_id(schedule_game, live_feed, side="away", fallback=card.away_pitcher)
         home_pitcher_id = self._preferred_pitcher_id(schedule_game, live_feed, side="home", fallback=card.home_pitcher)
@@ -509,8 +563,18 @@ class MlbDataClient:
         away_pitcher_name = card.away_pitcher.player_name if card.away_pitcher is not None else ""
         home_pitcher_name = card.home_pitcher.player_name if card.home_pitcher is not None else ""
 
-        away_pitcher = self._fetch_pitcher_from_player_id(away_pitcher_id, away_pitcher_name, season=season)
-        home_pitcher = self._fetch_pitcher_from_player_id(home_pitcher_id, home_pitcher_name, season=season)
+        away_pitcher = self._fetch_pitcher_from_player_id(
+            away_pitcher_id,
+            away_pitcher_name,
+            season=season,
+            throws=card.away_pitcher.throws if card.away_pitcher is not None else "",
+        )
+        home_pitcher = self._fetch_pitcher_from_player_id(
+            home_pitcher_id,
+            home_pitcher_name,
+            season=season,
+            throws=card.home_pitcher.throws if card.home_pitcher is not None else "",
+        )
         away_bullpen = self._fetch_team_bullpen_from_schedule_game(schedule_game, side="away", season=season)
         home_bullpen = self._fetch_team_bullpen_from_schedule_game(schedule_game, side="home", season=season)
 
@@ -617,7 +681,11 @@ class MlbDataClient:
             if not batting_order.endswith("0"):
                 continue
             name = _lookup(game_players, player_key, "fullName", default="") or _lookup(player_payload, "person", "fullName", default="")
-            lineup_rows.append((int(batting_order or 0), LineupPlayer(int(batter_id), str(name))))
+            bats = (
+                _normalize_batting_side(_lookup(game_players, player_key, "batSide", "code", default=""))
+                or _normalize_batting_side(_lookup(player_payload, "person", "batSide", "code", default=""))
+            )
+            lineup_rows.append((int(batting_order or 0), LineupPlayer(int(batter_id), str(name), bats=bats)))
 
         lineup_rows.sort(key=lambda item: item[0])
         return [player for _, player in lineup_rows[:9]]
@@ -640,7 +708,14 @@ class MlbDataClient:
             batting_order = str(player_payload.get("battingOrder", ""))
             if not batting_order.endswith("0"):
                 continue
-            season_stats = (player_payload.get("seasonStats", {}) or {}).get("batting") or {}
+            bats = (
+                _normalize_batting_side(_lookup(game_players, player_key, "batSide", "code", default=""))
+                or _normalize_batting_side(_lookup(player_payload, "person", "batSide", "code", default=""))
+            )
+            season_stats = _merge_handedness_into_record(
+                (player_payload.get("seasonStats", {}) or {}).get("batting") or {},
+                bats=bats,
+            )
             name = _lookup(game_players, player_key, "fullName", default="") or _lookup(player_payload, "person", "fullName", default="")
             lineup_rows.append(
                 (
@@ -650,6 +725,7 @@ class MlbDataClient:
                         str(name),
                         season=season,
                         current_record=season_stats if _batting_stats_are_complete(season_stats) else None,
+                        bats=bats,
                     ),
                 )
             )
@@ -669,13 +745,21 @@ class MlbDataClient:
         player_key = f"ID{preferred}"
         team_box = _lookup(live_feed, "liveData", "boxscore", "teams", side, default={})
         players = team_box.get("players", {}) or {}
-        season_stats = (players.get(player_key, {}) or {}).get("seasonStats", {}).get("pitching") or {}
+        throws = (
+            _normalize_throwing_hand(_lookup(live_feed, "gameData", "players", player_key, "pitchHand", "code", default=""))
+            or _normalize_throwing_hand(_lookup(players.get(player_key, {}) or {}, "person", "pitchHand", "code", default=""))
+        )
+        season_stats = _merge_handedness_into_record(
+            (players.get(player_key, {}) or {}).get("seasonStats", {}).get("pitching") or {},
+            throws=throws,
+        )
         name = _lookup(live_feed, "gameData", "players", player_key, "fullName", default="")
         return self._resolve_pitcher_stats(
             preferred,
             str(name),
             season=season,
             current_record=season_stats if _pitching_stats_are_complete(season_stats) else None,
+            throws=throws,
         )
 
     def _preferred_pitcher_id(
@@ -725,13 +809,14 @@ class MlbDataClient:
             or _lookup(schedule_game, "teams", side, "probablePitcher", "lastInitName", default="")
             or _lookup(schedule_game, "teams", side, "probablePitcher", "lastName", default="")
         )
-        return LineupPlayer(int(pitcher_id), _clean_name(name) or schedule_game_team_name(schedule_game, side))
+        throws = _normalize_throwing_hand(_lookup(live_feed, "gameData", "players", player_key, "pitchHand", "code", default=""))
+        return LineupPlayer(int(pitcher_id), _clean_name(name) or schedule_game_team_name(schedule_game, side), throws=throws)
 
-    def _fetch_batter_from_player_id(self, player_id: int, player_name: str, *, season: int) -> BattingStats:
-        return self._resolve_batter_stats(player_id, player_name, season=season)
+    def _fetch_batter_from_player_id(self, player_id: int, player_name: str, *, season: int, bats: str = "") -> BattingStats:
+        return self._resolve_batter_stats(player_id, player_name, season=season, bats=bats)
 
-    def _fetch_pitcher_from_player_id(self, player_id: int, player_name: str, *, season: int) -> PitchingStats:
-        return self._resolve_pitcher_stats(player_id, player_name, season=season)
+    def _fetch_pitcher_from_player_id(self, player_id: int, player_name: str, *, season: int, throws: str = "") -> PitchingStats:
+        return self._resolve_pitcher_stats(player_id, player_name, season=season, throws=throws)
 
     def _fetch_team_bullpen_from_schedule_game(
         self,
@@ -792,6 +877,9 @@ class MlbDataClient:
             strikeout_rate=profile.strikeout_rate,
             home_run_rate_allowed=profile.home_run_rate_allowed,
             non_home_run_hit_rate_allowed=profile.non_home_run_hit_rate_allowed,
+            single_share_allowed=profile.single_share_allowed,
+            double_share_allowed=profile.double_share_allowed,
+            triple_share_allowed=profile.triple_share_allowed,
             average_pitches=18.0,
             average_batters_faced_per_start=9.0,
         )
@@ -912,10 +1000,14 @@ class MlbDataClient:
         *,
         season: int,
         current_record: dict[str, Any] | None = None,
+        bats: str = "",
     ) -> BattingStats:
         cache_key = (int(player_id), int(season))
         cached = self._resolved_batting_stats_cache.get(cache_key)
         if cached is not None:
+            normalized_bats = _normalize_batting_side(bats)
+            if normalized_bats and not cached.bats:
+                cached.bats = normalized_bats
             return cached
 
         base_record = self._resolve_base_record(
@@ -925,7 +1017,16 @@ class MlbDataClient:
             season=int(season),
             current_record=current_record,
         )
-        stats = batter_stats_from_record(player_id, player_name, base_record)
+        resolved_record = _merge_handedness_into_record(base_record, bats=bats)
+        if resolved_record != base_record:
+            self._persist_player_record(
+                int(player_id),
+                _clean_name(player_name),
+                group="hitting",
+                season=int(season),
+                stat_record=resolved_record,
+            )
+        stats = batter_stats_from_record(player_id, player_name, resolved_record)
         profile = self._load_materialized_profile(player_id, group="hitting", season=season)
         if profile is None:
             historical_prior = self._build_historical_batting_prior(player_id, player_name, season=season)
@@ -946,10 +1047,14 @@ class MlbDataClient:
         *,
         season: int,
         current_record: dict[str, Any] | None = None,
+        throws: str = "",
     ) -> PitchingStats:
         cache_key = (int(player_id), int(season))
         cached = self._resolved_pitching_stats_cache.get(cache_key)
         if cached is not None:
+            normalized_throws = _normalize_throwing_hand(throws)
+            if normalized_throws and not cached.throws:
+                cached.throws = normalized_throws
             return cached
 
         base_record = self._resolve_base_record(
@@ -959,7 +1064,16 @@ class MlbDataClient:
             season=int(season),
             current_record=current_record,
         )
-        stats = pitcher_stats_from_record(player_id, player_name, base_record)
+        resolved_record = _merge_handedness_into_record(base_record, throws=throws)
+        if resolved_record != base_record:
+            self._persist_player_record(
+                int(player_id),
+                _clean_name(player_name),
+                group="pitching",
+                season=int(season),
+                stat_record=resolved_record,
+            )
+        stats = pitcher_stats_from_record(player_id, player_name, resolved_record)
         profile = self._load_materialized_profile(player_id, group="pitching", season=season)
         if profile is None:
             historical_prior = self._build_historical_pitching_prior(player_id, player_name, season=season)
@@ -997,6 +1111,33 @@ class MlbDataClient:
                 self._player_stat_cache[(player_id, group, season)] = normalized
             return normalized
         return self._fetch_player_stat_record(player_id, player_name, group=group, season=season)
+
+    def _persist_player_record(
+        self,
+        player_id: int,
+        player_name: str,
+        *,
+        group: str,
+        season: int,
+        stat_record: dict[str, Any],
+    ) -> None:
+        if int(season) == date.today().year:
+            path = player_current_cache_path(self._player_cache_root(), group, player_id)
+            kind = "current"
+        else:
+            path = player_season_cache_path(self._player_cache_root(), group, season, player_id)
+            kind = "season"
+        normalized = dict(stat_record)
+        self._write_player_cache_file(
+            path,
+            player_id=player_id,
+            player_name=player_name,
+            group=group,
+            season=season,
+            kind=kind,
+            stat_record=normalized,
+        )
+        self._player_stat_cache[(player_id, group, season)] = normalized
 
     def _build_historical_batting_prior(self, player_id: int, player_name: str, *, season: int) -> list[tuple[BattingStats, float]]:
         weighted_stats: list[tuple[BattingStats, float]] = []
@@ -1511,6 +1652,7 @@ def batter_stats_from_record(player_id: int, player_name: str, record: dict[str,
     return BattingStats(
         player_id=int(player_id),
         player_name=_clean_name(player_name),
+        bats=_normalize_batting_side(record.get("bats") or record.get("batSide")),
         on_base=on_base,
         hit_by_pitch=hit_by_pitch,
         sac_flies=sac_flies,
@@ -1531,6 +1673,9 @@ def batter_stats_from_record(player_id: int, player_name: str, record: dict[str,
 def pitcher_stats_from_record(player_id: int, player_name: str, record: dict[str, Any]) -> PitchingStats:
     innings_pitched = _innings_to_decimal(record.get("inningsPitched"))
     hits = _safe_float(record.get("hits"))
+    doubles_allowed = _safe_float(record.get("doubles"))
+    triples_allowed = _safe_float(record.get("triples"))
+    has_hit_type_detail = any(key in record for key in ("doubles", "triples", "2B", "3B"))
     walks = _safe_float(record.get("baseOnBalls"))
     hit_batsmen = _safe_float(record.get("hitBatsmen") or record.get("hitByPitch"))
     strikeouts = _safe_float(record.get("strikeOuts"))
@@ -1571,11 +1716,15 @@ def pitcher_stats_from_record(player_id: int, player_name: str, record: dict[str
     return PitchingStats(
         player_id=int(player_id),
         player_name=_clean_name(player_name),
+        throws=_normalize_throwing_hand(record.get("throws") or record.get("pitchHand")),
         on_base=on_base,
         average_pitches=average_pitches,
         games_started=games_started,
         innings_pitched=innings_pitched,
         hits_allowed=hits,
+        doubles_allowed=doubles_allowed,
+        triples_allowed=triples_allowed,
+        has_hit_type_detail=has_hit_type_detail,
         walks_allowed=walks,
         hit_batsmen=hit_batsmen,
         strikeouts=strikeouts,
@@ -1988,6 +2137,9 @@ def weighted_average_pitching_stats(
         games_started=avg("games_started"),
         innings_pitched=avg("innings_pitched"),
         hits_allowed=avg("hits_allowed"),
+        doubles_allowed=avg("doubles_allowed"),
+        triples_allowed=avg("triples_allowed"),
+        has_hit_type_detail=any(stats.has_hit_type_detail for stats, _ in weighted_stats),
         walks_allowed=avg("walks_allowed"),
         hit_batsmen=avg("hit_batsmen"),
         strikeouts=avg("strikeouts"),
@@ -2040,6 +2192,9 @@ def combine_pitching_stats_with_prior(current: PitchingStats, prior: PitchingSta
         games_started=current.games_started + prior.games_started,
         innings_pitched=current.innings_pitched + prior.innings_pitched,
         hits_allowed=current.hits_allowed + prior.hits_allowed,
+        doubles_allowed=current.doubles_allowed + prior.doubles_allowed,
+        triples_allowed=current.triples_allowed + prior.triples_allowed,
+        has_hit_type_detail=current.has_hit_type_detail or prior.has_hit_type_detail,
         walks_allowed=current.walks_allowed + prior.walks_allowed,
         hit_batsmen=current.hit_batsmen + prior.hit_batsmen,
         strikeouts=current.strikeouts + prior.strikeouts,
@@ -2076,6 +2231,8 @@ def pitching_stats_to_record(stats: PitchingStats) -> dict[str, Any]:
         "obp": stats.on_base,
         "inningsPitched": stats.innings_pitched,
         "hits": stats.hits_allowed,
+        "doubles": stats.doubles_allowed,
+        "triples": stats.triples_allowed,
         "baseOnBalls": stats.walks_allowed,
         "hitBatsmen": stats.hit_batsmen,
         "strikeOuts": stats.strikeouts,
@@ -2098,7 +2255,7 @@ def _weighted_rate_and_sample(weighted_values: list[tuple[float, float, float]],
         total_weight += weight
     if weighted_sample <= 0.0 or total_weight <= 0.0:
         return max(fallback_rate, 0.0), max(fallback_sample, 0.0)
-    return weighted_events / weighted_sample, weighted_sample / total_weight
+    return weighted_events / weighted_sample, weighted_sample
 
 
 def _weighted_average_value(weighted_values: list[tuple[float, float]], *, fallback_value: float) -> float:
@@ -2269,10 +2426,30 @@ def build_resolved_pitching_profile(
         fallback_sample=_PITCHER_PRIOR_BF_CAPS["home_run"],
     )
     prior_non_hr_hit_rate, prior_non_hr_hit_sample = _weighted_rate_and_sample(
-        [(max(stats.hits_allowed - stats.home_runs_allowed, 0.0), stats.estimated_batters_faced, weight) for stats, weight in historical],
+        [(stats.non_home_run_hits_allowed, stats.estimated_batters_faced, weight) for stats, weight in historical],
         fallback_rate=league.non_home_run_hit_rate_per_pa,
         fallback_sample=_PITCHER_PRIOR_BF_CAPS["non_home_run_hit"],
     )
+
+    hit_type_prior_cap = max(league.non_home_run_hit_rate_per_pa * _PITCHER_PRIOR_BF_CAPS["non_home_run_hit"], 1.0)
+    current_non_hr_hits_allowed = current.non_home_run_hits_allowed
+    current_hit_type_sample = current_non_hr_hits_allowed if current.has_hit_type_detail else 0.0
+    prior_single_share, prior_single_share_sample = _weighted_rate_and_sample(
+        [(stats.singles_allowed, stats.non_home_run_hits_allowed, weight) for stats, weight in historical if stats.has_hit_type_detail],
+        fallback_rate=league.single_share_of_non_home_run_hits,
+        fallback_sample=hit_type_prior_cap,
+    )
+    prior_double_share, prior_double_share_sample = _weighted_rate_and_sample(
+        [(stats.doubles_allowed, stats.non_home_run_hits_allowed, weight) for stats, weight in historical if stats.has_hit_type_detail],
+        fallback_rate=league.double_share_of_non_home_run_hits,
+        fallback_sample=hit_type_prior_cap,
+    )
+    prior_triple_share, prior_triple_share_sample = _weighted_rate_and_sample(
+        [(stats.triples_allowed, stats.non_home_run_hits_allowed, weight) for stats, weight in historical if stats.has_hit_type_detail],
+        fallback_rate=league.triple_share_of_non_home_run_hits,
+        fallback_sample=hit_type_prior_cap,
+    )
+
     prior_pitches = _weighted_average_value(
         [(stats.average_pitches, weight) for stats, weight in historical if stats.average_pitches > 0.0],
         fallback_value=league.average_pitches_per_start,
@@ -2290,11 +2467,35 @@ def build_resolved_pitching_profile(
     strikeout_rate = _smoothed_rate_from_counts(current.strikeouts, current_bf, prior_rate=prior_strikeout_rate, prior_sample=_cap_prior_sample(prior_strikeout_sample, _PITCHER_PRIOR_BF_CAPS["strikeout"]))
     home_run_rate_allowed = _smoothed_rate_from_counts(current.home_runs_allowed, current_bf, prior_rate=prior_home_run_rate, prior_sample=_cap_prior_sample(prior_home_run_sample, _PITCHER_PRIOR_BF_CAPS["home_run"]))
     non_home_run_hit_rate_allowed = _smoothed_rate_from_counts(
-        max(current.hits_allowed - current.home_runs_allowed, 0.0),
+        current_non_hr_hits_allowed,
         current_bf,
         prior_rate=prior_non_hr_hit_rate,
         prior_sample=_cap_prior_sample(prior_non_hr_hit_sample, _PITCHER_PRIOR_BF_CAPS["non_home_run_hit"]),
     )
+
+    single_share_allowed = _smoothed_rate_from_counts(
+        current.singles_allowed,
+        current_hit_type_sample,
+        prior_rate=prior_single_share,
+        prior_sample=_cap_prior_sample(prior_single_share_sample, hit_type_prior_cap),
+    )
+    double_share_allowed = _smoothed_rate_from_counts(
+        current.doubles_allowed,
+        current_hit_type_sample,
+        prior_rate=prior_double_share,
+        prior_sample=_cap_prior_sample(prior_double_share_sample, hit_type_prior_cap),
+    )
+    triple_share_allowed = _smoothed_rate_from_counts(
+        current.triples_allowed,
+        current_hit_type_sample,
+        prior_rate=prior_triple_share,
+        prior_sample=_cap_prior_sample(prior_triple_share_sample, hit_type_prior_cap),
+    )
+    share_total = max(single_share_allowed + double_share_allowed + triple_share_allowed, 1e-6)
+    single_share_allowed /= share_total
+    double_share_allowed /= share_total
+    triple_share_allowed /= share_total
+
     average_pitches = _weighted_average_value(
         [
             (current.average_pitches, max(current_bf, 1.0)) if current.average_pitches > 0.0 else (0.0, 0.0),
@@ -2325,6 +2526,9 @@ def build_resolved_pitching_profile(
         strikeout_rate=strikeout_rate,
         home_run_rate_allowed=home_run_rate_allowed,
         non_home_run_hit_rate_allowed=non_home_run_hit_rate_allowed,
+        single_share_allowed=single_share_allowed,
+        double_share_allowed=double_share_allowed,
+        triple_share_allowed=triple_share_allowed,
         average_pitches=average_pitches,
         average_batters_faced_per_start=average_batters_faced_per_start,
     )
@@ -2360,7 +2564,9 @@ def _parse_starting_lineups_from_dom(soup: BeautifulSoup) -> list[LineupCard]:
 
         pitchers: list[LineupPlayer] = []
         for anchor in matchup.select("a.starting-lineups__pitcher--link[href]"):
-            player = _lineup_player_from_anchor(anchor)
+            player = _lineup_player_from_anchor(anchor, context_text=anchor.parent.get_text(" ", strip=True) if anchor.parent is not None else "")
+            if player is not None and not player.throws:
+                player.throws = _extract_throwing_hand(matchup.get_text(" ", strip=True))
             if player is None:
                 continue
             if any(existing.player_id == player.player_id for existing in pitchers):
@@ -2394,7 +2600,7 @@ def _parse_starting_lineups_from_dom(soup: BeautifulSoup) -> list[LineupCard]:
     return cards
 
 
-def _lineup_player_from_anchor(anchor: Any) -> LineupPlayer | None:
+def _lineup_player_from_anchor(anchor: Any, *, context_text: str = "") -> LineupPlayer | None:
     href = anchor.get("href") or ""
     match = _PLAYER_ID_RE.search(href)
     if not match:
@@ -2402,7 +2608,13 @@ def _lineup_player_from_anchor(anchor: Any) -> LineupPlayer | None:
     name = _clean_name(anchor.get_text(" ", strip=True))
     if not name:
         return None
-    return LineupPlayer(int(match.group(1)), name)
+    surrounding_text = f"{context_text} {anchor.get_text(' ', strip=True)}"
+    return LineupPlayer(
+        int(match.group(1)),
+        name,
+        bats=_extract_batting_side(surrounding_text),
+        throws=_extract_throwing_hand(surrounding_text),
+    )
 
 
 def _extract_lineup_from_ol(ol: Any) -> list[LineupPlayer]:
@@ -2413,14 +2625,14 @@ def _extract_lineup_from_ol(ol: Any) -> list[LineupPlayer]:
     for item in ol.find_all("li", recursive=False):
         anchor = item.select_one("a.starting-lineups__player--link[href]")
         if anchor is not None:
-            player = _lineup_player_from_anchor(anchor)
+            player = _lineup_player_from_anchor(anchor, context_text=item.get_text(" ", strip=True))
             if player is not None:
                 lineup.append(player)
         else:
             text = _clean_name(item.get_text(" ", strip=True))
             if text:
                 name = re.sub(r"\s+\([LRS]\).*$", "", text).strip()
-                lineup.append(LineupPlayer(0, name))
+                lineup.append(LineupPlayer(0, name, bats=_extract_batting_side(text)))
         if len(lineup) >= 9:
             break
 
@@ -2462,19 +2674,27 @@ def _parse_starting_lineups_from_text_fallback(soup: BeautifulSoup) -> list[Line
             index += 1
             continue
 
-        probable_names: list[str] = []
-        for candidate in lines[index + 1:first_label]:
+        probable_pitchers: list[LineupPlayer] = []
+        probable_section = lines[index + 1:first_label]
+        for candidate_index, candidate in enumerate(probable_section):
             if candidate in player_ids_by_name:
-                probable_names.append(candidate)
-            if len(probable_names) == 2:
+                nearby = " ".join(probable_section[max(candidate_index - 1, 0):candidate_index + 2])
+                probable_pitchers.append(
+                    LineupPlayer(
+                        player_ids_by_name[candidate],
+                        candidate,
+                        throws=_extract_throwing_hand(nearby),
+                    )
+                )
+            if len(probable_pitchers) == 2:
                 break
 
         away_pitcher = None
         home_pitcher = None
-        if probable_names:
-            away_pitcher = LineupPlayer(player_ids_by_name[probable_names[0]], probable_names[0])
-        if len(probable_names) > 1:
-            home_pitcher = LineupPlayer(player_ids_by_name[probable_names[1]], probable_names[1])
+        if probable_pitchers:
+            away_pitcher = probable_pitchers[0]
+        if len(probable_pitchers) > 1:
+            home_pitcher = probable_pitchers[1]
 
         away_lineup, home_lineup, consumed_until = _parse_lineups_from_text_lines(
             lines,
@@ -2530,13 +2750,17 @@ def _collect_lineup_rows(
 
         name = None
         match = _LINEUP_ROW_RE.match(line)
+        batting_side = ""
         if match:
             name = match.group(2).strip()
+            batting_side = _extract_batting_side(line)
             index += 1
         elif re.fullmatch(r"\d+\.", line) and index + 1 < len(lines):
             name = lines[index + 1].strip()
+            batting_side = _extract_batting_side(name)
             index += 2
             if index < len(lines) and lines[index].startswith("("):
+                batting_side = batting_side or _extract_batting_side(lines[index])
                 index += 1
         else:
             index += 1
@@ -2544,9 +2768,9 @@ def _collect_lineup_rows(
         if name is None:
             continue
         if name != "TBD" and name in player_ids_by_name:
-            lineup.append(LineupPlayer(player_ids_by_name[name], name))
+            lineup.append(LineupPlayer(player_ids_by_name[name], name, bats=batting_side))
         else:
-            lineup.append(LineupPlayer(0, name))
+            lineup.append(LineupPlayer(0, name, bats=batting_side))
         if len(lineup) == 9:
             break
 
