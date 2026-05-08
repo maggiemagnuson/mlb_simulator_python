@@ -44,6 +44,14 @@ class GameConfig:
     bullpen_strikeout_rate_multiplier: float = 1.05
     bullpen_home_run_rate_multiplier: float = 0.96
     bullpen_non_home_run_hit_rate_multiplier: float = 0.96
+    platoon_same_side_walk_multiplier: float = 0.97
+    platoon_same_side_strikeout_multiplier: float = 1.05
+    platoon_same_side_home_run_multiplier: float = 0.92
+    platoon_same_side_non_home_run_hit_multiplier: float = 0.97
+    platoon_opposite_side_walk_multiplier: float = 1.03
+    platoon_opposite_side_strikeout_multiplier: float = 0.97
+    platoon_opposite_side_home_run_multiplier: float = 1.08
+    platoon_opposite_side_non_home_run_hit_multiplier: float = 1.03
 
 
 @dataclass(slots=True)
@@ -272,6 +280,9 @@ class MonteCarloSimulator:
             strikeout_rate=strikeout_rate,
             home_run_rate_allowed=home_run_rate,
             non_home_run_hit_rate_allowed=non_hr_hit_rate,
+            single_share_allowed=starter.non_home_run_hit_probabilities_allowed(league)["single"],
+            double_share_allowed=starter.non_home_run_hit_probabilities_allowed(league)["double"],
+            triple_share_allowed=starter.non_home_run_hit_probabilities_allowed(league)["triple"],
             average_pitches=18.0,
             average_batters_faced_per_start=9.0,
         )
@@ -345,7 +356,7 @@ class MonteCarloSimulator:
             self._handle_home_run(batter_key, batter_stats, bases, scoreboard, box_score)
             return outs
         if outcome == "non_home_run_hit":
-            self._handle_non_home_run_hit(batter, batter_key, batter_stats, outs, bases, scoreboard, box_score)
+            self._handle_non_home_run_hit(batter, pitcher, batter_key, batter_stats, outs, bases, scoreboard, box_score)
             return outs
         if outcome == "in_play_out":
             return self._handle_in_play_out(
@@ -360,40 +371,91 @@ class MonteCarloSimulator:
 
     def _plate_appearance_probabilities(self, batter: BattingStats, pitcher: PitchingStats) -> PlateAppearanceProbabilities:
         league = self.league_averages
+        matchup_side = self._platoon_matchup_side(batter, pitcher)
+
+        batter_walk = batter.walk_rate(league)
+        batter_walk = self._apply_platoon_multiplier(
+            batter_walk,
+            matchup_side,
+            same_side_multiplier=self.config.platoon_same_side_walk_multiplier,
+            opposite_side_multiplier=self.config.platoon_opposite_side_walk_multiplier,
+        )
+        pitcher_walk = pitcher.walk_rate_allowed(league)
         walk = self._log5_probability(
-            batter.walk_rate(league),
-            pitcher.walk_rate_allowed(league),
+            batter_walk,
+            pitcher_walk,
             league.walk_rate_per_pa,
         )
-        hit_by_pitch = self._log5_probability(
-            batter.hit_by_pitch_rate(league),
-            pitcher.hit_by_pitch_rate_allowed(league),
-            league.hit_by_pitch_rate_per_pa,
-        )
-        strikeout = self._log5_probability(
-            batter.strikeout_rate(league),
-            pitcher.strikeout_rate(league),
-            league.strikeout_rate_per_pa,
-        )
-        home_run = self._log5_probability(
-            batter.home_run_rate(league),
-            pitcher.home_run_rate_allowed(league),
-            league.home_run_rate_per_pa,
-        )
-        non_home_run_hit = self._log5_probability(
-            batter.non_home_run_hit_rate(league),
-            pitcher.non_home_run_hit_rate_allowed(league),
-            league.non_home_run_hit_rate_per_pa,
-        )
 
-        total = walk + hit_by_pitch + strikeout + home_run + non_home_run_hit
-        if total > self.config.max_plate_appearance_event_total:
-            scale = self.config.max_plate_appearance_event_total / total
-            walk *= scale
-            hit_by_pitch *= scale
-            strikeout *= scale
-            home_run *= scale
-            non_home_run_hit *= scale
+        batter_hbp = batter.hit_by_pitch_rate(league)
+        pitcher_hbp = pitcher.hit_by_pitch_rate_allowed(league)
+        hit_by_pitch_given_no_walk = self._conditional_matchup_probability(
+            batter_hbp,
+            pitcher_hbp,
+            league.hit_by_pitch_rate_per_pa,
+            batter_blocked_rate=batter_walk,
+            pitcher_blocked_rate=pitcher_walk,
+            league_blocked_rate=league.walk_rate_per_pa,
+        )
+        remaining = max(1.0 - walk, 0.0)
+        hit_by_pitch = remaining * hit_by_pitch_given_no_walk
+
+        batter_strikeout = batter.strikeout_rate(league)
+        batter_strikeout = self._apply_platoon_multiplier(
+            batter_strikeout,
+            matchup_side,
+            same_side_multiplier=self.config.platoon_same_side_strikeout_multiplier,
+            opposite_side_multiplier=self.config.platoon_opposite_side_strikeout_multiplier,
+        )
+        pitcher_strikeout = pitcher.strikeout_rate(league)
+        strikeout_given_no_walk_or_hbp = self._conditional_matchup_probability(
+            batter_strikeout,
+            pitcher_strikeout,
+            league.strikeout_rate_per_pa,
+            batter_blocked_rate=batter_walk + batter_hbp,
+            pitcher_blocked_rate=pitcher_walk + pitcher_hbp,
+            league_blocked_rate=league.walk_rate_per_pa + league.hit_by_pitch_rate_per_pa,
+        )
+        remaining = max(1.0 - walk - hit_by_pitch, 0.0)
+        strikeout = remaining * strikeout_given_no_walk_or_hbp
+
+        batter_home_run = batter.home_run_rate(league)
+        batter_home_run = self._apply_platoon_multiplier(
+            batter_home_run,
+            matchup_side,
+            same_side_multiplier=self.config.platoon_same_side_home_run_multiplier,
+            opposite_side_multiplier=self.config.platoon_opposite_side_home_run_multiplier,
+        )
+        pitcher_home_run = pitcher.home_run_rate_allowed(league)
+        home_run_given_ball_not_in_play = self._conditional_matchup_probability(
+            batter_home_run,
+            pitcher_home_run,
+            league.home_run_rate_per_pa,
+            batter_blocked_rate=batter_walk + batter_hbp + batter_strikeout,
+            pitcher_blocked_rate=pitcher_walk + pitcher_hbp + pitcher_strikeout,
+            league_blocked_rate=league.walk_rate_per_pa + league.hit_by_pitch_rate_per_pa + league.strikeout_rate_per_pa,
+        )
+        remaining = max(1.0 - walk - hit_by_pitch - strikeout, 0.0)
+        home_run = remaining * home_run_given_ball_not_in_play
+
+        batter_non_hr_hit = batter.non_home_run_hit_rate(league)
+        batter_non_hr_hit = self._apply_platoon_multiplier(
+            batter_non_hr_hit,
+            matchup_side,
+            same_side_multiplier=self.config.platoon_same_side_non_home_run_hit_multiplier,
+            opposite_side_multiplier=self.config.platoon_opposite_side_non_home_run_hit_multiplier,
+        )
+        pitcher_non_hr_hit = pitcher.non_home_run_hit_rate_allowed(league)
+        non_home_run_hit_on_contact = self._conditional_matchup_probability(
+            batter_non_hr_hit,
+            pitcher_non_hr_hit,
+            league.non_home_run_hit_rate_per_pa,
+            batter_blocked_rate=batter_walk + batter_hbp + batter_strikeout + batter_home_run,
+            pitcher_blocked_rate=pitcher_walk + pitcher_hbp + pitcher_strikeout + pitcher_home_run,
+            league_blocked_rate=league.walk_rate_per_pa + league.hit_by_pitch_rate_per_pa + league.strikeout_rate_per_pa + league.home_run_rate_per_pa,
+        )
+        remaining = max(1.0 - walk - hit_by_pitch - strikeout - home_run, 0.0)
+        non_home_run_hit = remaining * non_home_run_hit_on_contact
 
         return PlateAppearanceProbabilities(
             walk=walk,
@@ -402,6 +464,68 @@ class MonteCarloSimulator:
             home_run=home_run,
             non_home_run_hit=non_home_run_hit,
         )
+
+    @staticmethod
+    def _apply_platoon_multiplier(
+        rate: float,
+        matchup_side: str,
+        *,
+        same_side_multiplier: float,
+        opposite_side_multiplier: float,
+    ) -> float:
+        if matchup_side == "same":
+            rate *= same_side_multiplier
+        elif matchup_side == "opposite":
+            rate *= opposite_side_multiplier
+        return max(min(rate, 0.999999), 0.0)
+
+    @staticmethod
+    def _platoon_matchup_side(batter: BattingStats, pitcher: PitchingStats) -> str:
+        pitcher_throws = str(pitcher.throws or "").upper()
+        if pitcher_throws not in {"L", "R"}:
+            return "neutral"
+        batter_side = batter.effective_batting_side(pitcher_throws)
+        if batter_side not in {"L", "R"}:
+            return "neutral"
+        return "same" if batter_side == pitcher_throws else "opposite"
+
+    @staticmethod
+    def _conditional_rate(unconditional_rate: float, blocked_rate: float) -> float:
+        available_rate = max(1.0 - max(blocked_rate, 0.0), 1e-6)
+        return max(min(unconditional_rate / available_rate, 0.999999), 0.0)
+
+    def _conditional_matchup_probability(
+        self,
+        batter_rate: float,
+        pitcher_rate: float,
+        league_rate: float,
+        *,
+        batter_blocked_rate: float,
+        pitcher_blocked_rate: float,
+        league_blocked_rate: float,
+    ) -> float:
+        return self._log5_probability(
+            self._conditional_rate(batter_rate, batter_blocked_rate),
+            self._conditional_rate(pitcher_rate, pitcher_blocked_rate),
+            self._conditional_rate(league_rate, league_blocked_rate),
+        )
+
+    def _combined_non_home_run_hit_probabilities(self, batter: BattingStats, pitcher: PitchingStats) -> dict[str, float]:
+        batter_probabilities = batter.non_home_run_hit_probabilities(self.league_averages)
+        pitcher_probabilities = pitcher.non_home_run_hit_probabilities_allowed(self.league_averages)
+        league_probabilities = {
+            "single": self.league_averages.single_share_of_non_home_run_hits,
+            "double": self.league_averages.double_share_of_non_home_run_hits,
+            "triple": self.league_averages.triple_share_of_non_home_run_hits,
+        }
+        weights = {
+            outcome: (max(batter_probabilities[outcome], 0.0) * max(pitcher_probabilities[outcome], 0.0)) / max(league_probabilities[outcome], 1e-6)
+            for outcome in ("single", "double", "triple")
+        }
+        total = sum(weights.values())
+        if total <= 0.0:
+            return league_probabilities
+        return {outcome: value / total for outcome, value in weights.items()}
 
     @staticmethod
     def _log5_probability(batter_rate: float, pitcher_rate: float, league_rate: float) -> float:
@@ -413,6 +537,7 @@ class MonteCarloSimulator:
         if denominator <= 0.0:
             return league_rate
         return max(min(numerator / denominator, 0.999999), 0.0)
+
 
     def _select_plate_appearance_outcome(self, probabilities: PlateAppearanceProbabilities) -> str:
         draw = self.rng.random()
@@ -436,6 +561,7 @@ class MonteCarloSimulator:
     def _handle_non_home_run_hit(
         self,
         batter: BattingStats,
+        pitcher: PitchingStats,
         batter_key: PlayerKey,
         batter_stats: PlayerGameStats,
         outs: int,
@@ -443,7 +569,7 @@ class MonteCarloSimulator:
         scoreboard: ScoreBoard,
         box_score: dict[PlayerKey, PlayerGameStats],
     ) -> None:
-        hit_type_probabilities = batter.non_home_run_hit_probabilities(self.league_averages)
+        hit_type_probabilities = self._combined_non_home_run_hit_probabilities(batter, pitcher)
         draw = self.rng.random()
         cumulative = hit_type_probabilities["single"]
         if draw <= cumulative:
