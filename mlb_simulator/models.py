@@ -39,6 +39,21 @@ def _clamp_rate(value: float) -> float:
     return max(min(float(value), 0.999999), 0.0)
 
 
+def _normalize_handedness(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"L", "R", "S"}:
+        return text
+    return ""
+
+
+def _normalize_shares(weighted: Mapping[str, float], fallback: Mapping[str, float]) -> dict[str, float]:
+    normalized = {name: max(float(value), 0.0) for name, value in weighted.items()}
+    total = sum(normalized.values())
+    if total <= 0.0:
+        return {name: max(float(value), 0.0) for name, value in fallback.items()}
+    return {name: value / total for name, value in normalized.items()}
+
+
 def _smoothed_rate_from_counts(observed_events: float, sample: float, *, prior_rate: float, prior_sample: float) -> float:
     sample = max(sample, 0.0)
     prior_sample = max(prior_sample, 0.0)
@@ -107,19 +122,18 @@ class ResolvedBattingProfile:
         )
 
     def normalized_non_home_run_hit_shares(self, league: LeagueAverages) -> dict[str, float]:
-        weighted = {
-            "single": max(self.single_share, 0.0),
-            "double": max(self.double_share, 0.0),
-            "triple": max(self.triple_share, 0.0),
-        }
-        total = sum(weighted.values())
-        if total <= 0.0:
-            return {
+        return _normalize_shares(
+            {
+                "single": self.single_share,
+                "double": self.double_share,
+                "triple": self.triple_share,
+            },
+            {
                 "single": league.single_share_of_non_home_run_hits,
                 "double": league.double_share_of_non_home_run_hits,
                 "triple": league.triple_share_of_non_home_run_hits,
-            }
-        return {name: value / total for name, value in weighted.items()}
+            },
+        )
 
 
 @dataclass(slots=True)
@@ -131,6 +145,9 @@ class ResolvedPitchingProfile:
     strikeout_rate: float = 0.0
     home_run_rate_allowed: float = 0.0
     non_home_run_hit_rate_allowed: float = 0.0
+    single_share_allowed: float = 0.0
+    double_share_allowed: float = 0.0
+    triple_share_allowed: float = 0.0
     average_pitches: float = 0.0
     average_batters_faced_per_start: float = 0.0
 
@@ -143,6 +160,9 @@ class ResolvedPitchingProfile:
             "strikeout_rate": self.strikeout_rate,
             "home_run_rate_allowed": self.home_run_rate_allowed,
             "non_home_run_hit_rate_allowed": self.non_home_run_hit_rate_allowed,
+            "single_share_allowed": self.single_share_allowed,
+            "double_share_allowed": self.double_share_allowed,
+            "triple_share_allowed": self.triple_share_allowed,
             "average_pitches": self.average_pitches,
             "average_batters_faced_per_start": self.average_batters_faced_per_start,
         }
@@ -157,8 +177,25 @@ class ResolvedPitchingProfile:
             strikeout_rate=_to_float(payload.get("strikeout_rate")),
             home_run_rate_allowed=_to_float(payload.get("home_run_rate_allowed")),
             non_home_run_hit_rate_allowed=_to_float(payload.get("non_home_run_hit_rate_allowed")),
+            single_share_allowed=_to_float(payload.get("single_share_allowed")),
+            double_share_allowed=_to_float(payload.get("double_share_allowed")),
+            triple_share_allowed=_to_float(payload.get("triple_share_allowed")),
             average_pitches=_to_float(payload.get("average_pitches")),
             average_batters_faced_per_start=_to_float(payload.get("average_batters_faced_per_start")),
+        )
+
+    def normalized_non_home_run_hit_shares(self, league: LeagueAverages) -> dict[str, float]:
+        return _normalize_shares(
+            {
+                "single": self.single_share_allowed,
+                "double": self.double_share_allowed,
+                "triple": self.triple_share_allowed,
+            },
+            {
+                "single": league.single_share_of_non_home_run_hits,
+                "double": league.double_share_of_non_home_run_hits,
+                "triple": league.triple_share_of_non_home_run_hits,
+            },
         )
 
 
@@ -166,6 +203,7 @@ class ResolvedPitchingProfile:
 class BattingStats:
     player_id: int
     player_name: str = ""
+    bats: str = ""
     on_base: float = 0.0
     hit_by_pitch: float = 0.0
     sac_flies: float = 0.0
@@ -194,6 +232,7 @@ class BattingStats:
         return cls(
             player_id=_to_int(_lookup(payload, "playerID", "playerId", "id")),
             player_name=_clean_name(_lookup(payload, "playerName", "name")),
+            throws=_normalize_handedness(_lookup(payload, "throws", "pitchHand", default="")),
             on_base=_to_float(_lookup(payload, "onBase", "obp", "OBP")),
             hit_by_pitch=_to_float(_lookup(payload, "hitByPitch", "hbp", "HBP")),
             sac_flies=_to_float(_lookup(payload, "sacFlies", "sf", "SF")),
@@ -309,6 +348,15 @@ class BattingStats:
             prior_sample=league.min_plate_appearances,
         )
         return max(smoothed_rate * 600.0, 0.0)
+
+    def effective_batting_side(self, opposing_throws: str = "") -> str:
+        bats = _normalize_handedness(self.bats)
+        throws = _normalize_handedness(opposing_throws)
+        if bats == "S" and throws == "L":
+            return "R"
+        if bats == "S" and throws == "R":
+            return "L"
+        return bats
 
     def double_play_speed_multiplier(self, league: LeagueAverages) -> float:
         baseline = 5.0
@@ -431,11 +479,15 @@ class BattingStats:
 class PitchingStats:
     player_id: int
     player_name: str = ""
+    throws: str = ""
     on_base: float = 0.0
     average_pitches: float = 0.0
     games_started: float = 0.0
     innings_pitched: float = 0.0
     hits_allowed: float = 0.0
+    doubles_allowed: float = 0.0
+    triples_allowed: float = 0.0
+    has_hit_type_detail: bool = False
     walks_allowed: float = 0.0
     hit_batsmen: float = 0.0
     strikeouts: float = 0.0
@@ -446,14 +498,19 @@ class PitchingStats:
 
     @classmethod
     def from_api(cls, payload: Mapping[str, Any]) -> "PitchingStats":
+        has_hit_type_detail = any(key in payload for key in ("doublesAllowed", "doubles", "2B", "triplesAllowed", "triples", "3B"))
         return cls(
             player_id=_to_int(_lookup(payload, "playerID", "playerId", "id")),
             player_name=_clean_name(_lookup(payload, "playerName", "name")),
+            throws=_normalize_handedness(_lookup(payload, "throws", "pitchHand", default="")),
             on_base=_to_float(_lookup(payload, "onBase", "obp", "OBP")),
             average_pitches=_to_float(_lookup(payload, "aveNumOfPitches", "averagePitches")),
             games_started=_to_float(_lookup(payload, "gamesStarted", "GS")),
             innings_pitched=_to_float(_lookup(payload, "inningsPitched", "IP")),
             hits_allowed=_to_float(_lookup(payload, "hitsAllowed", "hits", "H")),
+            doubles_allowed=_to_float(_lookup(payload, "doublesAllowed", "doubles", "2B")),
+            triples_allowed=_to_float(_lookup(payload, "triplesAllowed", "triples", "3B")),
+            has_hit_type_detail=has_hit_type_detail,
             walks_allowed=_to_float(_lookup(payload, "bb", "walksAllowed", "walks", "BB", "baseOnBalls")),
             hit_batsmen=_to_float(_lookup(payload, "hitBatsmen", "hitByPitch", "HBP")),
             strikeouts=_to_float(_lookup(payload, "strikeOuts", "so", "SO")),
@@ -473,6 +530,9 @@ class PitchingStats:
             games_started=max(league.min_innings_pitched / 5.5, 1.0),
             innings_pitched=league.min_innings_pitched,
             hits_allowed=league.hits_total,
+            doubles_allowed=league.doubles_total,
+            triples_allowed=league.triples_total,
+            has_hit_type_detail=True,
             walks_allowed=league.walks_total,
             hit_batsmen=league.hit_by_pitch_total,
             strikeouts=league.strikeouts_total,
@@ -506,6 +566,47 @@ class PitchingStats:
             self.batters_faced,
             self.at_bats_against + self.walks_allowed + self.hit_batsmen,
             self.innings_pitched * 4.25,
+        )
+
+    @property
+    def non_home_run_hits_allowed(self) -> float:
+        return max(self.hits_allowed - self.home_runs_allowed, 0.0)
+
+    @property
+    def singles_allowed(self) -> float:
+        return max(self.non_home_run_hits_allowed - self.doubles_allowed - self.triples_allowed, 0.0)
+
+    def non_home_run_hit_probabilities_allowed(self, league: LeagueAverages) -> dict[str, float]:
+        if self.resolved_profile is not None:
+            return self.resolved_profile.normalized_non_home_run_hit_shares(league)
+        sample_non_home_run_hits = self.non_home_run_hits_allowed if self.has_hit_type_detail else 0.0
+        prior_non_home_run_hits = league.non_home_run_hit_rate_per_pa * league.prior_batters_faced_for_pitcher_prior
+        return _normalize_shares(
+            {
+                "single": _smoothed_rate_from_counts(
+                    self.singles_allowed,
+                    sample_non_home_run_hits,
+                    prior_rate=league.single_share_of_non_home_run_hits,
+                    prior_sample=prior_non_home_run_hits,
+                ),
+                "double": _smoothed_rate_from_counts(
+                    self.doubles_allowed,
+                    sample_non_home_run_hits,
+                    prior_rate=league.double_share_of_non_home_run_hits,
+                    prior_sample=prior_non_home_run_hits,
+                ),
+                "triple": _smoothed_rate_from_counts(
+                    self.triples_allowed,
+                    sample_non_home_run_hits,
+                    prior_rate=league.triple_share_of_non_home_run_hits,
+                    prior_sample=prior_non_home_run_hits,
+                ),
+            },
+            {
+                "single": league.single_share_of_non_home_run_hits,
+                "double": league.double_share_of_non_home_run_hits,
+                "triple": league.triple_share_of_non_home_run_hits,
+            },
         )
 
     def _fallback_allowed_rate(self, league_rate: float, league: LeagueAverages, *, scale_to_on_base: bool) -> float:
