@@ -24,7 +24,7 @@ def _format_hit_probability(value: float) -> str:
 
 
 def _write_projection_rows(path: Path, projection_rows) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.writer(handle)
         writer.writerow(["Player", "Team", "AB", "R", "H", "1+H%", "2+H%", "2B", "3B", "HR", "RBI", "BB", "AVG", "OBP", "SLG"])
         for projection in projection_rows:
