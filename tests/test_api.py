@@ -57,8 +57,10 @@ class MlbDataClientTest(unittest.TestCase):
         self.assertEqual(card.home_team, "Mets")
         self.assertEqual(card.away_pitcher.player_id, 694973)
         self.assertEqual(card.home_pitcher.player_id, 642547)
+        self.assertEqual(card.away_pitcher.throws, "R")
         self.assertEqual(len(card.away_lineup), 9)
         self.assertEqual(card.away_lineup[0].player_name, "Oneil Cruz")
+        self.assertEqual(card.away_lineup[0].bats, "L")
         self.assertEqual(card.home_lineup[-1].player_id, 682626)
 
     def test_parse_starting_lineups_html_extracts_dom_matchup_cards(self) -> None:
@@ -120,6 +122,7 @@ class MlbDataClientTest(unittest.TestCase):
         self.assertEqual(len(card.away_lineup), 9)
         self.assertEqual(len(card.home_lineup), 9)
         self.assertEqual(card.away_lineup[0].player_name, "Ronald Acuna Jr.")
+        self.assertEqual(card.away_lineup[0].bats, "R")
         self.assertEqual(card.home_lineup[-1].player_id, 660688)
 
     def test_parse_team_bullpen_stats_html_extracts_team_rows(self) -> None:
@@ -191,7 +194,9 @@ class MlbDataClientTest(unittest.TestCase):
         self.assertEqual(game.away_team, "Away Team")
         self.assertEqual(len(game.away_lineup), 9)
         self.assertEqual(game.away_lineup[0].player_name, "Away 1")
+        self.assertEqual(game.away_lineup[0].bats, "L")
         self.assertEqual(game.away_pitching[0].player_name, "Away Pitcher")
+        self.assertEqual(game.away_pitching[0].throws, "R")
         self.assertEqual(game.home_pitching[0].player_name, "Home Pitcher")
 
     def test_fetch_game_falls_back_to_starting_lineups_page(self) -> None:
@@ -208,10 +213,10 @@ class MlbDataClientTest(unittest.TestCase):
         card = LineupCard(
             away_team="Away Team",
             home_team="Home Team",
-            away_lineup=[LineupPlayer(idx, f"Away {idx}") for idx in range(1, 10)],
-            home_lineup=[LineupPlayer(100 + idx, f"Home {idx}") for idx in range(1, 10)],
-            away_pitcher=LineupPlayer(1001, "Away Pitcher"),
-            home_pitcher=LineupPlayer(2001, "Home Pitcher"),
+            away_lineup=[LineupPlayer(idx, f"Away {idx}", bats="L" if idx % 2 else "R") for idx in range(1, 10)],
+            home_lineup=[LineupPlayer(100 + idx, f"Home {idx}", bats="R" if idx % 2 else "L") for idx in range(1, 10)],
+            away_pitcher=LineupPlayer(1001, "Away Pitcher", throws="R"),
+            home_pitcher=LineupPlayer(2001, "Home Pitcher", throws="L"),
         )
 
         def fake_statsapi_get(path, *, params=None):
@@ -239,8 +244,10 @@ class MlbDataClientTest(unittest.TestCase):
 
         self.assertEqual(len(game.away_lineup), 9)
         self.assertEqual(game.away_lineup[0].player_id, 1)
+        self.assertEqual(game.away_lineup[0].bats, "L")
         self.assertEqual(game.home_lineup[-1].player_id, 109)
         self.assertEqual(game.away_pitching[0].player_id, 1001)
+        self.assertEqual(game.away_pitching[0].throws, "R")
         self.assertGreater(game.away_pitching[0].on_base, 0.0)
 
     def test_fetch_game_falls_back_when_live_feed_404s(self) -> None:
@@ -256,10 +263,10 @@ class MlbDataClientTest(unittest.TestCase):
         card = LineupCard(
             away_team="Away Team",
             home_team="Home Team",
-            away_lineup=[LineupPlayer(idx, f"Away {idx}") for idx in range(1, 10)],
-            home_lineup=[LineupPlayer(100 + idx, f"Home {idx}") for idx in range(1, 10)],
-            away_pitcher=LineupPlayer(1001, "Away Pitcher"),
-            home_pitcher=LineupPlayer(2001, "Home Pitcher"),
+            away_lineup=[LineupPlayer(idx, f"Away {idx}", bats="L" if idx % 2 else "R") for idx in range(1, 10)],
+            home_lineup=[LineupPlayer(100 + idx, f"Home {idx}", bats="R" if idx % 2 else "L") for idx in range(1, 10)],
+            away_pitcher=LineupPlayer(1001, "Away Pitcher", throws="R"),
+            home_pitcher=LineupPlayer(2001, "Home Pitcher", throws="L"),
         )
 
         def fake_statsapi_get(path, *, params=None):
@@ -323,10 +330,10 @@ class MlbDataClientTest(unittest.TestCase):
         card = LineupCard(
             away_team="Away Team",
             home_team="Home Team",
-            away_lineup=[LineupPlayer(idx, f"Away {idx}") for idx in range(1, 10)],
-            home_lineup=[LineupPlayer(100 + idx, f"Home {idx}") for idx in range(1, 10)],
-            away_pitcher=LineupPlayer(1001, "Away Pitcher"),
-            home_pitcher=LineupPlayer(2001, "Home Pitcher"),
+            away_lineup=[LineupPlayer(idx, f"Away {idx}", bats="L" if idx % 2 else "R") for idx in range(1, 10)],
+            home_lineup=[LineupPlayer(100 + idx, f"Home {idx}", bats="R" if idx % 2 else "L") for idx in range(1, 10)],
+            away_pitcher=LineupPlayer(1001, "Away Pitcher", throws="R"),
+            home_pitcher=LineupPlayer(2001, "Home Pitcher", throws="L"),
         )
 
         with patch.object(MlbDataClient, "_get_schedule_game", return_value=schedule_game):
@@ -608,6 +615,25 @@ class MlbDataClientTest(unittest.TestCase):
             self.assertGreater(slugger.resolved_profile.home_run_rate, contact.resolved_profile.home_run_rate)
             self.assertGreater(contact.resolved_profile.stolen_bases_per_600_pa, slugger.resolved_profile.stolen_bases_per_600_pa)
 
+    def test_resolved_stats_persist_explicit_handedness_to_cache(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            client = MlbDataClient(player_cache_dir=str(cache_dir))
+
+            with patch.object(MlbDataClient, "_fetch_player_stat_record_from_api", side_effect=lambda player_id, *, group, season: hitting_stat_record(player_id) if group == "hitting" else pitching_stat_record(player_id)):
+                batter = client._resolve_batter_stats(77, "Switch Hitter", season=2026, bats="S")
+                pitcher = client._resolve_pitcher_stats(88, "Lefty", season=2026, throws="L")
+
+            self.assertEqual(batter.bats, "S")
+            self.assertEqual(pitcher.throws, "L")
+            hitter_payload = json.loads((cache_dir / "current" / "hitting" / "77.json").read_text(encoding="utf-8"))
+            pitcher_payload = json.loads((cache_dir / "current" / "pitching" / "88.json").read_text(encoding="utf-8"))
+            self.assertEqual(hitter_payload["stat_record"]["bats"], "S")
+            self.assertEqual(pitcher_payload["stat_record"]["throws"], "L")
+
 def make_live_feed_with_lineups() -> dict:
     away_players = {}
     home_players = {}
@@ -622,7 +648,7 @@ def make_live_feed_with_lineups() -> dict:
             "battingOrder": f"{idx}00",
             "seasonStats": {"batting": hitting_stat_record(batter_id)},
         }
-        game_players[f"ID{batter_id}"] = {"fullName": f"Away {idx}"}
+        game_players[f"ID{batter_id}"] = {"fullName": f"Away {idx}", "batSide": {"code": "L" if idx % 2 else "R"}}
 
     for idx in range(1, 10):
         batter_id = 100 + idx
@@ -631,12 +657,12 @@ def make_live_feed_with_lineups() -> dict:
             "battingOrder": f"{idx}00",
             "seasonStats": {"batting": hitting_stat_record(batter_id)},
         }
-        game_players[f"ID{batter_id}"] = {"fullName": f"Home {idx}"}
+        game_players[f"ID{batter_id}"] = {"fullName": f"Home {idx}", "batSide": {"code": "R" if idx % 2 else "L"}}
 
     away_players["ID1001"] = {"seasonStats": {"pitching": pitching_stat_record(1001)}}
     home_players["ID2001"] = {"seasonStats": {"pitching": pitching_stat_record(2001)}}
-    game_players["ID1001"] = {"fullName": "Away Pitcher"}
-    game_players["ID2001"] = {"fullName": "Home Pitcher"}
+    game_players["ID1001"] = {"fullName": "Away Pitcher", "pitchHand": {"code": "R"}}
+    game_players["ID2001"] = {"fullName": "Home Pitcher", "pitchHand": {"code": "L"}}
 
     return {
         "gameData": {"players": game_players},
@@ -653,7 +679,7 @@ def make_live_feed_with_lineups() -> dict:
 
 def make_live_feed_without_lineups() -> dict:
     return {
-        "gameData": {"players": {"ID1001": {"fullName": "Away Pitcher"}, "ID2001": {"fullName": "Home Pitcher"}}},
+        "gameData": {"players": {"ID1001": {"fullName": "Away Pitcher", "pitchHand": {"code": "R"}}, "ID2001": {"fullName": "Home Pitcher", "pitchHand": {"code": "L"}}}},
         "liveData": {
             "boxscore": {
                 "teams": {
